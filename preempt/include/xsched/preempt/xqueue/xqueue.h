@@ -35,12 +35,18 @@ public:
     virtual void Suspend(int64_t flags) = 0;
     virtual void Resume(int64_t flags) = 0;
 
-    /// @brief Set the preempt level of the XQueue. NOT thread-safe, make sure there is
-    /// NO other operations on the XQueue when calling this function.
+    /// Stop accepting suspension requests and resume before the manager drains the queue.
+    /// Callers must stop submitting new work before destroying a queue.
+    virtual void PrepareForDestroy() { Resume(kQueueResumeFlagNone); }
+
+    /// @brief Set the preempt level of the XQueue. Callers must exclude concurrent Submit.
+    /// AsyncXQueue serializes configuration changes with Suspend/Resume and waits for a
+    /// paused queue to be resumed by another thread before draining and applying changes.
     /// @param level The new preempt level.
     virtual void SetPreemptLevel(XPreemptLevel level) = 0;
 
     /// @brief Set the launching configuration of the XQueue.
+    /// Callers must exclude concurrent Submit. AsyncXQueue waits for Resume when paused.
     /// @param threshold The new in-flight command threshold, <= 0 means no change.
     /// @param batch_size The new command batch size, <= 0 means no change.
     virtual void SetLaunchConfig(int64_t threshold, int64_t batch_size) = 0;

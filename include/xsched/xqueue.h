@@ -16,6 +16,9 @@ extern "C" {
 XResult XQueueCreate(XQueueHandle *xq, HwQueueHandle hwq, int64_t level, int64_t flags);
 
 /// @brief Destroy an XQueue.
+/// Stop submissions before destruction. AsyncXQueue rejects late suspension requests,
+/// resumes retained work and drains it before this call returns. Do not concurrently
+/// destroy its underlying stream/context or other resources used by that work.
 /// @param xq [in] Handle to the XQueue.
 /// @return kXSchedSuccess if successful, otherwise an error code.
 XResult XQueueDestroy(XQueueHandle xq);
@@ -28,12 +31,16 @@ XResult XQueueDestroy(XQueueHandle xq);
 XResult XQueueGet(XQueueHandle *xq, HwQueueHandle hwq);
 
 /// @brief Set the preemption level of an XQueue.
+/// Stop concurrent submissions before this call. On an AsyncXQueue, a paused queue
+/// must be resumed by another thread before the change can be applied.
 /// @param xq    [in] Handle to the XQueue.
 /// @param level [in] Preemption level, see XPreemptLevel.
 /// @return kXSchedSuccess if successful, otherwise an error code.
 XResult XQueueSetPreemptLevel(XQueueHandle xq, XPreemptLevel level);
 
 /// @brief Set the launch threshold and command batch size of an XQueue.
+/// Stop concurrent submissions before this call. On an AsyncXQueue, a paused queue
+/// must be resumed by another thread before the change can be applied.
 /// @param xq         [in] Handle to the XQueue.
 /// @param threshold  [in] The number of commands that can be in flight.
 /// @param batch_size [in] The number of commands to launch and synchronize at a time.
@@ -65,6 +72,11 @@ XResult XQueueWaitAll(XQueueHandle xq);
 XResult XQueueQuery(XQueueHandle xq, XQueueState *state);
 
 /// @brief Suspend an XQueue to stop its execution. Re-entrant.
+/// On an AsyncXQueue, SyncHwQueue also confirms an already requested suspension;
+/// it does not imply command completion or that all device engines are idle.
+/// WaitAll/WaitIdle apply before a new suspension, not to an already paused queue.
+/// These waits do not hold the control lock. Overlapping Resume does not cancel
+/// a pending pre-suspension wait; the suspension can take effect after that wait.
 /// @param xq    [in] Handle to the XQueue.
 /// @param flags [in] Suspend flags, see XQueueSuspendFlag.
 /// @return kXSchedSuccess if successful, otherwise an error code.

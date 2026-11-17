@@ -20,6 +20,11 @@ public:
     virtual void OnXQueueCreate() override;
     static CUresult DirectLaunch(std::shared_ptr<CudaKernelCommand> kernel, CUstream stream);
 
+    // A submitted event record remains valid across preemption/restoration and
+    // is not discarded or replayed in a way that changes an already inserted wait.
+    // Allows unmanaged streams to wait natively after record submission.
+    virtual bool SupportNativeEventWait() const { return false; }
+
     unsigned int          GetStreamFlags()       const    { return stream_flags_; }
     virtual XDevice       GetDevice()            override { return xdevice_; }
     virtual HwQueueHandle GetHandle()            override { return GetHwQueueHandle(kStream); }

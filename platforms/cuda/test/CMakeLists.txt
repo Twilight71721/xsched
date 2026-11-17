@@ -63,3 +63,7 @@ endforeach()
 if(TARGET sm120_channel_contract)
     target_link_libraries(sm120_channel_contract PRIVATE cuda)
 endif()
+
+if(TARGET shim_contract)
+    target_link_libraries(shim_contract PRIVATE cuda protocol)
+endif()

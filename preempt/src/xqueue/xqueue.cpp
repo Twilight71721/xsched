@@ -65,7 +65,7 @@ XResult XQueueManager::Del(XQueueHandle xq_h)
 
     // Wait for all commands to finish to prevent the launch worker from launching
     // commands on the HwQueue after the XQueue is deleted from the XQueueManager.
-    xq_shptr->Resume(kQueueResumeFlagNone);
+    xq_shptr->PrepareForDestroy();
     xq_shptr->WaitAll();
     return kXSchedSuccess;
 }

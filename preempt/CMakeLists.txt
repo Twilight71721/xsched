@@ -40,3 +40,12 @@ target_link_libraries(preempt
     PRIVATE sched
     PRIVATE protocol
 )
+
+if(BUILD_TEST)
+    add_executable(async_xqueue_control_test test/async_xqueue_control.cpp)
+    target_link_libraries(async_xqueue_control_test PRIVATE preempt protocol utils)
+    target_compile_options(async_xqueue_control_test PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME async_xqueue_control_test COMMAND async_xqueue_control_test)
+    set_tests_properties(async_xqueue_control_test PROPERTIES
+        ENVIRONMENT "XSCHED_SCHEDULER=APP" TIMEOUT 30)
+endif()

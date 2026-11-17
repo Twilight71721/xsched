@@ -1,0 +1,7 @@
+{
+    global:
+        ioctl;
+        dlopen;
+        xsched_cuda_channel_control_v2;
+    local: *;
+};

@@ -28,6 +28,7 @@ public:
 
     virtual void Suspend(int64_t flags) override;
     virtual void Resume(int64_t flags) override;
+    void PrepareForDestroy() override;
 
     virtual void SetPreemptLevel(XPreemptLevel level) override;
     virtual void SetLaunchConfig(int64_t threshold, int64_t batch_size) override;
@@ -40,6 +41,10 @@ private:
     std::atomic_bool suspended_ = { false };
     std::atomic_bool terminated_ = { false };
     std::mutex preemption_mutex_;
+    std::condition_variable preemption_cv_;
+
+    void ResumeLocked(int64_t flags);
+    std::unique_lock<std::mutex> LockForConfiguration();
 
     // The index of HwCommand starts from 1.
     std::atomic<int64_t> next_hw_cmd_idx_ = { 1 };

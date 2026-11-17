@@ -27,11 +27,13 @@ def main():
     tracker = args.install / 'lib/libcuda_channel_tracker.so'
     gpu = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version,memory.used,temperature.gpu',
                           '--format=csv'], text=True, capture_output=True, check=True).stdout
-    files = [tracker, args.install / 'bin/cuda/sm120_lv3', args.install / 'bin/cuda/sm120_channel_contract']
+    files = [tracker, args.install / 'bin/cuda/sm120_lv3',
+             args.install / 'bin/cuda/sm120_channel_contract', args.install / 'bin/cuda/shim_contract']
     metadata = dict(gpu=gpu, install=str(args.install), build=str(args.build), repeats=args.repeats,
                     sha256={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files})
     (args.output / 'metadata.json').write_text(json.dumps(metadata, indent=2))
     cases = [('tracker-unit', [str(args.build / 'platforms/cuda/cuda_channel_tracker_test')], False)]
+    cases.append(('shim-contract', [str(args.install / 'bin/cuda/shim_contract')], False))
     for repeat in range(args.repeats):
         cases.extend([
             (f'lv3-r{repeat}', [str(args.install / 'bin/cuda/sm120_lv3')], True),
@@ -44,6 +46,8 @@ def main():
     results = []
     for name, command, preload in cases:
         case_env = dict(env)
+        if name == 'shim-contract':
+            case_env.pop('XSCHED_CUDA_LV3_IMPL', None)
         if preload:
             case_env['LD_PRELOAD'] = str(tracker)
         result = subprocess.run(['timeout', '--kill-after=3s', '60s', *command], env=case_env,

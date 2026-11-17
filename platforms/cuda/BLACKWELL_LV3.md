@@ -3,7 +3,7 @@
 This backend adds state-preserving compute preemption on the validated SM120
 configuration below. Select it explicitly with `XSCHED_CUDA_LV3_IMPL=CHANNEL`
 and preload `libcuda_channel_tracker.so` before CUDA initialization. The default
-backend selection is unchanged. This change does not add SM120 Guardian Level 2.
+backend selection is unchanged. This PR does not include SM120 Guardian Level 2.
 
 ## Mechanism and scope
 
@@ -37,8 +37,6 @@ review and hardware validation before changing the version check.
 
 ## Queue contract
 
-- `CudaQueueGetChannelInfo` reports context ownership, compute-group scope,
-  preserved in-flight work, independent-copy behavior and lack of drop support.
 - `XQueueSuspend(..., kQueueSuspendFlagSyncHwQueue)` confirms compute suspension,
   not command completion or complete context quiescence. Independent copy-engine
   transfers may continue. Do not free buffers based on suspension alone.
@@ -86,7 +84,48 @@ handling, not a recoverable-error API.
 - Adding HAL virtual methods changes the internal C++ ABI. Rebuild preempt, HAL,
   shim and any out-of-tree HAL subclasses together.
 
+## AsyncXQueue control ordering
+
+- A repeated suspend with `kQueueSuspendFlagSyncHwQueue` confirms the existing
+  suspension, including one initially requested without synchronization. It does
+  not issue a second `Deactivate()` or `Interrupt()`. Confirmation and restoration
+  remain serialized, so restoration cannot invalidate an in-progress confirmation.
+- `WaitAll` and `WaitIdle` are preconditions for a new suspension. They are skipped
+  when already suspended, and their completion waits do not hold the control mutex.
+  Another thread can suspend/resume during those waits. A concurrent Resume does
+  not cancel the waiting request: it may suspend the queue after its wait finishes.
+- Level/launch-configuration changes wait for a paused queue to be resumed by
+  another thread, then drain and apply under the control mutex. They recheck the
+  state after draining, and never silently resume a paused queue themselves.
+  Callers must still exclude concurrent submissions during configuration changes;
+  this is not a general concurrent submission/configuration protocol.
+- Before destruction drains the queue, `PrepareForDestroy()` marks control as
+  terminated and resumes it. A pending or late Suspend holding an older shared
+  reference cannot pause it again; pending configuration changes are abandoned.
+  Callers must stop submissions and retain the underlying CUDA resources until
+  destruction finishes. Concurrent destruction of CUDA resources is unsupported.
+- HAL suspension confirmation must not require Resume on the same queue to
+  complete. CHANNEL fulfills this with synchronous compute-channel disable;
+  ordinary stream completion still requires the retained work to execute.
+
+The GPU-free `async_xqueue_control_test` forces delayed confirmation, blocked
+completion, configuration/suspension races and deletion with an outstanding
+reference. Run it after building with `BUILD_TEST=ON`:
+
+```bash
+ctest --test-dir build-channel -R '^async_xqueue_control_test$' --output-on-failure
+```
+
+The preemption changes preserve the default suspension synchronization for older
+backends; they do not validate TSG timeslice-zero semantics on other hardware.
+
 ## Build and test
+
+Production builds use `BUILD_TEST=OFF` (the default). This omits test executables
+and test syscall implementations. The tracker exports only `ioctl`, `dlopen`
+and the versioned internal `xsched_cuda_channel_control_v2` entry point; its
+private implementation header is not installed. There is no public CHANNEL
+inspection/test API. The scope and limitations above are the backend contract.
 
 From the repository root, using an initialized recursive checkout:
 
@@ -103,11 +142,15 @@ python3 platforms/cuda/test/scripts/run_lv3_contracts.py \
   --output /tmp/xsched-channel-contracts-new --repeats 3
 ```
 
+To validate common shim integration without CHANNEL or its tracker, run the
+installed `bin/cuda/shim_contract` with `XSCHED_SCHEDULER=APP`,
+`LD_LIBRARY_PATH` pointing to the install's `lib`, and no tracker `LD_PRELOAD`.
+
 The output directory must be new. The suite runs GPU tests serially with timeouts
 and saves metadata, binary hashes, stdout/stderr and a summary. It controls only
 the test process's channels and requires no root privileges or driver changes.
 
-The CPU test substitutes the syscall in the production tracker and covers
+The CPU test links the production tracker core with its own syscall implementation and covers
 ownership, binding, lifecycle guards, partial disable, rollback, retry, uncertain
 state recovery and overflow. It does not inject actual driver/firmware failures.
 
@@ -122,11 +165,18 @@ queue. GPU tests exit normally and exercise cleanup; they do not use `_Exit`.
 
 ## Implementation map
 
-- `hal/src/level3/channel.cpp`: HAL ownership, ToolsRm lookup and pause/resume.
+- `hal/src/level3/channel.cpp`: XSched queue interface and delegation to an exclusive `ChannelContext`.
+- `hal/src/level3/channel_context.cpp`: ownership, ToolsRm lookup, pause/resume and cleanup. Each queue owns its context controller; controllers are not shared like `TsgContext`. Context lifetime protection is held through a common RAII guard.
 - `hal/include/xsched/cuda/hal/level3/channel_control.h`: internal tracker ABI.
-- `tools/channel_tracker.cpp`: RM allocation tracking, disable/enable and recovery.
+- `tools/channel_tracker.cpp`: preload entry points and real system-call transport.
+- `tools/channel_tracker_core.cpp`: RM object tracking, ownership and disable/enable transactions.
+- `tools/channel_tracker_internal.h`: private RM layouts and implementation declarations.
+- `tools/channel_tracker.map`: export allowlist for the three required preload symbols.
 - `preempt/src/xqueue/async_xqueue.cpp`: control serialization and suspension boundary.
-- `shim/src/shim.cpp`: event dependencies and context-lifetime guards.
+- `hal/src/common/context_guard.cpp`: backend-independent, opt-in context ownership and guarded destroy/reset. An exclusive guard is held from backend acquisition through RM cleanup; it does not change ordinary LV1 queue ownership.
+- `hal/include/xsched/cuda/hal/level1/cuda_queue.h`: `SupportNativeEventWait()` defaults to false. A backend opts in only if submitted native event dependencies remain valid across its preemption/restoration and cancellation behavior.
+- `shim/src/shim.cpp`: common context guards and capability-based event waits; no CHANNEL type dependency.
+- `test/main/shim_contract.cu`: common guards, legacy event waiting and a non-CHANNEL queue opting into native waits, without the tracker.
 - `test/scripts/run_lv3_contracts.py`: repeatable correctness suite.
 
 RM layouts are derived from NVIDIA's matching open driver definitions:

@@ -60,6 +60,9 @@ struct Task
         CK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&dependent, cudaStreamNonBlocking));
         CK(CudaQueueCreate(&hwq, stream));
+        // Ownership starts with HwQueue, before an XQueue exists.
+        REQUIRE(cuCtxDestroy(ctx) == CUDA_ERROR_NOT_READY);
+        REQUIRE(cuDevicePrimaryCtxReset(0) == CUDA_ERROR_NOT_READY);
         CK(XQueueCreate(&xq, hwq, kPreemptLevelInterrupt, kQueueCreateFlagNone));
         CK(cudaHostAlloc((void **)&host, 3 * sizeof(unsigned), cudaHostAllocMapped));
         CK(cudaHostGetDevicePointer(&mapped, (void *)host, 0));
@@ -146,11 +149,6 @@ int main(int argc, char **argv)
     Task a, b;
     a.Create(2);
     b.Create(1);
-    CudaChannelInfo info{};
-    CK(CudaQueueGetChannelInfo(a.hwq, &info));
-    REQUIRE(info.context == a.ctx && info.compute_group_scope &&
-            info.independent_copies_may_run && info.preserves_inflight_work && !info.supports_drop_commands);
-    REQUIRE(CudaQueueGetChannelInfo(a.hwq, nullptr) == kXSchedErrorInvalidValue);
     REQUIRE(HwQueueDestroy(a.hwq) == kXSchedErrorNotAllowed);
     a.Launch(); b.Launch();
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -200,6 +198,10 @@ int main(int argc, char **argv)
     CK(XQueueDestroy(a.xq));
     waiter.join();
     REQUIRE(sync_done.load());
+    // XQueue destruction must not release its still-live HwQueue's ownership.
+    REQUIRE(cuCtxDestroy(a.ctx) == CUDA_ERROR_NOT_READY);
+    HwQueueHandle still_owned = 0;
+    REQUIRE(CudaQueueCreate(&still_owned, a.companion) != kXSchedSuccess && still_owned == 0);
     CK(HwQueueDestroy(a.hwq));
     // Reuse the same context and stream after releasing ownership.
     CK(CudaQueueCreate(&a.hwq, a.stream));

@@ -33,7 +33,12 @@ public:
     /// are flushed when deactivating the HwQueue, or killed when interrupting the HwQueue.
     virtual void Synchronize() = 0;
 
-    /// Confirm the suspension boundary; state-preserving backends need not finish commands.
+    /// Called after software submission is paused and Deactivate/Interrupt (if applicable).
+    /// Wait until this backend's suspension boundary is established. This does not mark
+    /// commands completed, discard retained work, or imply that all device engines are idle.
+    /// May be called repeatedly before Resume; must not require Resume on this queue to return.
+    /// The default retains the drain/flush/kill behavior of existing backends. Backends that
+    /// preserve stopped in-flight work must override it instead of waiting for completion.
     virtual void SynchronizeOnSuspend() { Synchronize(); }
 
     /// Whether resume can discard retained in-flight work.
