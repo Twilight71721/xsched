@@ -21,9 +21,8 @@ private:
                            std::vector<std::string>({"nvcuda_original.dll"}),
                            std::vector<std::string>({}));
 #elif defined(__linux__)
-    DEFINE_GET_SYMBOL_FUNC(GetSymbol, XSCHED_CUDA_LIB_ENV_NAME,
-                           std::vector<std::string>({"libcuda.so", "libcuda.so.1"}),
-                           std::vector<std::string>({}));
+    // The CUDA loader owns backend-specific binding policy.
+    static void *GetSymbol(const char *symbol_name);
 #endif
 
 public:

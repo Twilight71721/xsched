@@ -7,12 +7,13 @@ add_platform_test()
 
 # Optional preload helper for experimental Linux RM channel control.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    enable_language(ASM)
     add_library(cuda_channel_tracker SHARED
-        tools/channel_tracker.cpp tools/channel_tracker_core.cpp)
+        tools/channel_tracker.cpp tools/channel_tracker_core.cpp tools/channel_tracker_ioctl.S)
     target_include_directories(cuda_channel_tracker PRIVATE
         ${PROJECT_SOURCE_DIR}/utils/include ${CMAKE_CURRENT_SOURCE_DIR}/hal/include)
     target_compile_options(cuda_channel_tracker PRIVATE -Wall -Wextra -Werror)
-    target_link_libraries(cuda_channel_tracker PRIVATE pthread ${CMAKE_DL_LIBS})
+    target_link_libraries(cuda_channel_tracker PRIVATE pthread)
     set_property(TARGET cuda_channel_tracker APPEND_STRING PROPERTY LINK_FLAGS
         " -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tools/channel_tracker.map")
     set_property(TARGET cuda_channel_tracker APPEND PROPERTY LINK_DEPENDS
@@ -26,5 +27,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
         target_compile_options(cuda_channel_tracker_test PRIVATE -Wall -Wextra -Werror)
         target_link_libraries(cuda_channel_tracker_test PRIVATE pthread ${CMAKE_DL_LIBS})
         add_test(NAME cuda_channel_tracker_test COMMAND cuda_channel_tracker_test)
+        add_executable(cuda_channel_ioctl_test test/unit/channel_ioctl.cpp)
+        target_compile_options(cuda_channel_ioctl_test PRIVATE -Wall -Wextra -Werror)
+        add_test(NAME cuda_channel_ioctl_native_test COMMAND cuda_channel_ioctl_test)
+        add_test(NAME cuda_channel_ioctl_preload_test COMMAND ${CMAKE_COMMAND} -E env
+            "LD_PRELOAD=$<TARGET_FILE:cuda_channel_tracker>" $<TARGET_FILE:cuda_channel_ioctl_test>)
+        set_tests_properties(cuda_channel_ioctl_native_test cuda_channel_ioctl_preload_test
+            PROPERTIES TIMEOUT 10)
+
+        add_executable(cuda_channel_loading_test test/unit/channel_loading.cpp)
+        target_compile_options(cuda_channel_loading_test PRIVATE -Wall -Wextra -Werror)
+        target_link_libraries(cuda_channel_loading_test PRIVATE halcuda preempt protocol utils ${CMAKE_DL_LIBS})
     endif()
 endif()

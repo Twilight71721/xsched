@@ -9,11 +9,17 @@ std::unordered_map<HwQueueHandle, std::shared_ptr<HwQueue>> HwQueueManager::hwqs
 
 XResult HwQueueManager::Add(HwQueueHandle hwq_h, std::function<std::shared_ptr<HwQueue>()> create)
 {
+    return Add(hwq_h, std::move(create), false);
+}
+
+XResult HwQueueManager::Add(HwQueueHandle hwq_h, std::function<std::shared_ptr<HwQueue>()> create,
+                            bool require_new)
+{
     std::lock_guard<std::mutex> lock(mtx_);
     auto it = hwqs_.find(hwq_h);
     if (it != hwqs_.end()) {
         XWARN("HwQueue with handle 0x" FMT_64X " already exists", hwq_h);
-        return kXSchedSuccess;
+        return require_new ? kXSchedErrorNotAllowed : kXSchedSuccess;
     }
 
     auto hwq = create();

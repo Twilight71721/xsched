@@ -32,6 +32,8 @@ int RawIoctl(int, unsigned long req, void *arg)
     auto &c = *static_cast<RmControl *>(arg);
     auto &p = *reinterpret_cast<Disable *>(c.params);
     CHECK(c.cmd == 0x2080110b && !p.only_scheduling && !p.rewind && !p.event);
+    const auto state = GetState().owners.at({c.client, 10}).state;
+    CHECK(state == (p.disable ? GroupState::Pausing : GroupState::Restoring));
     int error = 0;
     if (!errors.empty()) { error = errors.front(); errors.pop_front(); }
     // A failing request can already have changed its first channel.
@@ -45,7 +47,7 @@ int RawIoctl(int, unsigned long req, void *arg)
 }
 
 constexpr unsigned Client = 1, Group = 10, Subdevice = 3;
-int Call(unsigned *handle, int op)
+ControlResult Call(unsigned *handle, int op)
 {
     return ControlGroup(7, Client, Subdevice, handle, op);
 }
@@ -68,22 +70,33 @@ void Setup()
 }
 }
 
+void CheckError(const ControlResult &result, ErrorDomain domain, unsigned code,
+                GroupState state, ErrorDomain recovery_domain = ErrorDomain::None,
+                unsigned recovery_code = 0)
+{
+    CHECK(!result.Succeeded());
+    CHECK(result.error.domain == domain && result.error.code == code);
+    CHECK(result.state == state);
+    CHECK(result.recovery_error.domain == recovery_domain && result.recovery_error.code == recovery_code);
+}
+
 int main()
 {
     Setup();
-    // Use the driver's returned handle, and never record failed allocations.
+    // Use returned handles and record only successful allocations, for both RM ABIs.
     Alloc64 allocation{Client, Group, 0, 0xc96f, 0, 0, 0, 0, 0};
     allocated_object = 13;
     CHECK(TrackIoctl(7, _IOWR('F', 0x2b, Alloc64), &allocation) == 0);
     CHECK(allocation.object == 13);
     CHECK(GetState().objects.at({Client, 13}).parent == Group);
     CHECK(GetState().objects.at({Client, 13}).cls == 0xc96f);
-    unsigned allocated_handle = 13;
-    CHECK(Call(&allocated_handle, 0) == 0 && allocated_handle == Group);
-    CHECK(Call(&allocated_handle, 1) == 0 && disabled.size() == 3);
+    unsigned handle = 13;
+    auto acquired = Call(&handle, kAcquire);
+    CHECK(acquired.Succeeded() && acquired.state == GroupState::Running && handle == Group);
+    CHECK(Call(&handle, kPause).Succeeded() && disabled.size() == 3);
     CHECK(TrackIoctl(7, _IOWR('F', 0x2b, Alloc64), &allocation) == -1 && errno == EBUSY);
-    CHECK(Call(&allocated_handle, 2) == 0 && disabled.empty());
-    CHECK(Call(&allocated_handle, 3) == 0);
+    CHECK(Call(&handle, kResume).Succeeded() && disabled.empty());
+    CHECK(Call(&handle, kRelease).Succeeded());
     allocation.object = 14;
     allocated_object = 14;
     allocation_error = 0x40;
@@ -95,62 +108,88 @@ int main()
     CHECK(errno == EIO && !GetState().objects.count({Client, 14}));
 
     Setup();
-    CHECK(Call(nullptr, 0) == EINVAL);
-    unsigned handle = 11;
-    CHECK(Call(&handle, 9) == EINVAL);
-    CHECK(Call(&handle, 0) == 0 && handle == Group);
+    CheckError(Call(nullptr, kAcquire), ErrorDomain::Validation, EINVAL, GroupState::Unowned);
+    handle = 11;
+    CheckError(Call(&handle, 9), ErrorDomain::Validation, EINVAL, GroupState::Unowned);
+    CHECK(Call(&handle, kAcquire).Succeeded() && handle == Group);
     unsigned duplicate = 12;
-    CHECK(Call(&duplicate, 0) == EBUSY && duplicate == 12);
-    CHECK(ControlGroup(8, Client, Subdevice, &handle, 1) == EINVAL);
-    CHECK(ControlGroup(7, Client, 99, &handle, 1) == EINVAL);
+    CheckError(Call(&duplicate, kAcquire), ErrorDomain::Validation, EBUSY, GroupState::Unowned);
+    CHECK(duplicate == 12);
+    CheckError(ControlGroup(8, Client, Subdevice, &handle, kPause),
+               ErrorDomain::Validation, EINVAL, GroupState::Unowned);
+    CheckError(ControlGroup(7, Client, 99, &handle, kPause),
+               ErrorDomain::Validation, EINVAL, GroupState::Unowned);
+    CheckError(Call(&handle, kConfirmPaused), ErrorDomain::Validation, EBUSY, GroupState::Running);
     CHECK(controls == 0);
     Free parent{Client, 0, Client, 0};
     CHECK(TrackIoctl(7, _IOWR('F', 0x29, Free), &parent) == -1 && errno == EBUSY);
-    CHECK(Call(&handle, 1) == 0 && disabled.size() == 2);
-    CHECK(Call(&handle, 1) == 0 && controls == 1);
-    CHECK(Call(&handle, 3) == EBUSY);
+    auto paused = Call(&handle, kPause);
+    CHECK(paused.Succeeded() && paused.state == GroupState::Paused && disabled.size() == 2);
+    CHECK(Call(&handle, kPause).Succeeded() && controls == 1);
+    CHECK(Call(&handle, kConfirmPaused).Succeeded() && controls == 1);
+    CheckError(Call(&handle, kRelease), ErrorDomain::Validation, EBUSY, GroupState::Paused);
     Alloc21 escaped{Client, Group, 13, 0xc96f, 0, 0, 0};
     CHECK(TrackIoctl(7, _IOWR('F', 0x2b, Alloc21), &escaped) == -1 && errno == EBUSY);
     Free child{Client, Group, 11, 0};
     CHECK(TrackIoctl(7, _IOWR('F', 0x29, Free), &child) == -1 && errno == EBUSY);
-    CHECK(Call(&handle, 2) == 0 && disabled.empty());
-    CHECK(Call(&handle, 2) == 0 && controls == 2);
+    CHECK(Call(&handle, kResume).Succeeded() && disabled.empty());
+    CHECK(Call(&handle, kResume).Succeeded() && controls == 2);
+    CheckError(Call(&handle, kConfirmPaused), ErrorDomain::Validation, EBUSY, GroupState::Running);
 
-    // Partial disable with successful rollback must remain an error.
-    errors = {-1, 0};
-    CHECK(Call(&handle, 1) == EIO && disabled.empty());
-    CHECK(!GetState().owners.at({Client, Group}).uncertain);
-    CHECK(Call(&handle, 1) == 0 && disabled.size() == 2);
-    // Transient enable failures are retried with the same snapshot.
-    errors = {0x40, -1, 0};
-    CHECK(Call(&handle, 2) == 0 && disabled.empty());
-
-    errors = {0x40, 0x40, -1, 0x40};
-    CHECK(Call(&handle, 1) == 0x40);
-    CHECK(GetState().owners.at({Client, Group}).uncertain);
-    CHECK(Call(&handle, 3) == EBUSY);
+    // The tracker alone retries a partial disable, only after complete rollback.
     unsigned before = controls;
-    CHECK(Call(&handle, 1) == EIO && controls == before);
+    errors = {-1, 0, 0};
+    CHECK(Call(&handle, kPause).Succeeded() && disabled.size() == 2);
+    CHECK(controls == before + 3 && errors.empty());
+    // Enable also retries, using the exact same channel snapshot.
+    errors = {0x40, -1, 0};
+    CHECK(Call(&handle, kResume).Succeeded() && disabled.empty() && errors.empty());
+
+    // Exhausted disable attempts with successful rollbacks are NOT success.
+    before = controls;
+    errors = {-1, 0, -1, 0, -1, 0};
+    CheckError(Call(&handle, kPause), ErrorDomain::System, EIO, GroupState::Running);
+    CHECK(controls == before + 6 && disabled.empty() && errors.empty());
+    CheckError(Call(&handle, kConfirmPaused), ErrorDomain::Validation, EBUSY, GroupState::Running);
+    // The same numeric code from RM remains distinguishable from errno.
+    errors = {EIO, 0, EIO, 0, EIO, 0};
+    CheckError(Call(&handle, kPause), ErrorDomain::Rm, EIO, GroupState::Running);
+    CHECK(disabled.empty() && errors.empty());
+
+    // Failed rollback retains the snapshot and prohibits pause/lifetime changes.
+    before = controls;
+    errors = {0x40, 0x40, -1, 0x40};
+    CheckError(Call(&handle, kPause), ErrorDomain::Rm, 0x40, GroupState::Unknown,
+               ErrorDomain::Rm, 0x40);
+    CHECK(controls == before + 4 && errors.empty());
+    CHECK(GetState().owners.at({Client, Group}).channels.size() == 2);
+    CheckError(Call(&handle, kRelease), ErrorDomain::Validation, EBUSY, GroupState::Unknown);
+    before = controls;
+    CheckError(Call(&handle, kPause), ErrorDomain::Validation, EIO, GroupState::Unknown);
+    CheckError(Call(&handle, kConfirmPaused), ErrorDomain::Validation, EBUSY, GroupState::Unknown);
+    CHECK(controls == before);
     CHECK(TrackIoctl(7, _IOWR('F', 0x2b, Alloc21), &escaped) == -1 && errno == EBUSY);
-    CHECK(Call(&handle, 2) == 0 && disabled.empty());
-    CHECK(!GetState().owners.at({Client, Group}).uncertain);
-    CHECK(Call(&handle, 1) == 0);
+    CHECK(TrackIoctl(7, _IOWR('F', 0x29, Free), &child) == -1 && errno == EBUSY);
+    CHECK(Call(&handle, kResume).Succeeded() && disabled.empty());
+    CHECK(GetState().owners.at({Client, Group}).state == GroupState::Running);
+    CHECK(Call(&handle, kPause).Succeeded());
     errors = {-1, -1, -1};
-    CHECK(Call(&handle, 2) == EIO);
-    CHECK(GetState().owners.at({Client, Group}).uncertain);
-    CHECK(Call(&handle, 3) == EBUSY);
-    CHECK(Call(&handle, 2) == 0 && disabled.empty());
-    CHECK(Call(&handle, 3) == 0);
+    CheckError(Call(&handle, kResume), ErrorDomain::System, EIO, GroupState::Unknown);
+    CheckError(Call(&handle, kRelease), ErrorDomain::Validation, EBUSY, GroupState::Unknown);
+    CHECK(Call(&handle, kResume).Succeeded() && disabled.empty());
+    auto released = Call(&handle, kRelease);
+    CHECK(released.Succeeded() && released.state == GroupState::Unowned);
     CHECK(TrackIoctl(7, _IOWR('F', 0x29, Free), &parent) == 0);
     CHECK(GetState().objects.empty());
     handle = 11;
-    CHECK(Call(&handle, 0) == ENOENT);
+    CheckError(Call(&handle, kAcquire), ErrorDomain::Validation, ENOENT, GroupState::Unowned);
 
     Setup();
     for (unsigned i = 13; i < 76; ++i) Allocate(Group, i, 0xc96f);
     handle = 11;
-    CHECK(Call(&handle, 0) == 0);
-    CHECK(Call(&handle, 1) == EOVERFLOW && controls == 0);
-    CHECK(Call(&handle, 3) == 0);
-    puts("PASS: allocation ABIs, ownership, binding, lifecycle, partial failure, rollback, recovery, overflow");
+    CHECK(Call(&handle, kAcquire).Succeeded());
+    CheckError(Call(&handle, kPause), ErrorDomain::Validation, EOVERFLOW, GroupState::Running);
+    CHECK(controls == 0);
+    CHECK(Call(&handle, kRelease).Succeeded());
+    puts("PASS: allocation ABIs, ownership, binding, lifecycle, state transitions, error domains, bounded retries, rollback, recovery, overflow");
 }

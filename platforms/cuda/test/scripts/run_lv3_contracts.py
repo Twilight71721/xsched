@@ -28,25 +28,37 @@ def main():
     gpu = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version,memory.used,temperature.gpu',
                           '--format=csv'], text=True, capture_output=True, check=True).stdout
     files = [tracker, args.install / 'bin/cuda/sm120_lv3',
-             args.install / 'bin/cuda/sm120_channel_contract', args.install / 'bin/cuda/shim_contract']
+             args.install / 'bin/cuda/sm120_channel_contract', args.install / 'bin/cuda/shim_contract',
+             args.install / 'bin/cuda/sm120_task_domain', args.install / 'lib/libhalcuda.so', args.install / 'lib/libpreempt.so',
+             args.build / 'platforms/cuda/cuda_channel_tracker_test',
+             args.build / 'platforms/cuda/cuda_channel_ioctl_test',
+             args.build / 'platforms/cuda/cuda_channel_loading_test']
     metadata = dict(gpu=gpu, install=str(args.install), build=str(args.build), repeats=args.repeats,
                     sha256={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files})
     (args.output / 'metadata.json').write_text(json.dumps(metadata, indent=2))
     cases = [('tracker-unit', [str(args.build / 'platforms/cuda/cuda_channel_tracker_test')], False)]
+    cases.append(('ioctl-preload', [str(args.build / 'platforms/cuda/cuda_channel_ioctl_test')], True))
+    for mode in ('hal-first', 'driver-first', 'deepbound-first'):
+        cases.append((f'loading-{mode}',
+                      [str(args.build / 'platforms/cuda/cuda_channel_loading_test'), mode], True))
     cases.append(('shim-contract', [str(args.install / 'bin/cuda/shim_contract')], False))
     for repeat in range(args.repeats):
         cases.extend([
             (f'lv3-r{repeat}', [str(args.install / 'bin/cuda/sm120_lv3')], True),
+            (f'domain-create-r{repeat}', [str(args.install / 'bin/cuda/sm120_task_domain'), 'both-new'], True),
+            (f'domain-r{repeat}', [str(args.install / 'bin/cuda/sm120_task_domain')], True),
             (f'contract-r{repeat}', [str(args.install / 'bin/cuda/sm120_channel_contract')], True),
         ])
     cases.extend([
         ('duplicate-owner', [str(args.install / 'bin/cuda/sm120_lv3'), 'duplicate'], True),
+        ('domain-other-backend', [str(args.install / 'bin/cuda/sm120_task_domain'), 'unavailable'], True),
+        ('domain-missing-tracker', [str(args.install / 'bin/cuda/sm120_task_domain'), 'unavailable'], False),
         ('missing-tracker', [str(args.install / 'bin/cuda/sm120_channel_contract'), 'missing-tracker'], False),
     ])
     results = []
     for name, command, preload in cases:
         case_env = dict(env)
-        if name == 'shim-contract':
+        if name in ('shim-contract', 'domain-other-backend'):
             case_env.pop('XSCHED_CUDA_LV3_IMPL', None)
         if preload:
             case_env['LD_PRELOAD'] = str(tracker)

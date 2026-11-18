@@ -11,6 +11,7 @@ class CudaQueueLv3Channel : public CudaQueueLv1
 {
 public:
     static std::shared_ptr<preempt::HwQueue> Create(CUstream stream);
+    static std::shared_ptr<preempt::HwQueue> Create(CUstream stream, XResult &status);
     ~CudaQueueLv3Channel() override = default;
     void Deactivate() override;
     void Interrupt() override;

@@ -43,7 +43,7 @@ int TrackIoctl(int fd, unsigned long req, void *arg)
         // Context/group lifetime must outlive its registered queue. New channels
         // while paused would escape the disabled set, so reject that allocation.
         if ((freeing && Descendant(s, client, key.second, object)) ||
-            ((owner.paused || owner.uncertain) &&
+            (owner.state != GroupState::Running &&
              Descendant(s, client, freeing ? object : parent, key.second))) {
             errno = EBUSY;
             return -1;
@@ -73,50 +73,12 @@ int TrackIoctl(int fd, unsigned long req, void *arg)
     return result;
 }
 
-// op: 0 acquire (handle is a compute channel, returns its group), 1 pause,
-// 2 resume, 3 release. Nonzero errors must never be interpreted as suspension.
-int ControlGroup(int fd, unsigned client, unsigned subdevice,
-                                             unsigned *handle, int op)
+namespace
 {
-    if (!handle || fd < 0 || !client || !subdevice || op < kAcquire || op > kRelease) return EINVAL;
-    auto &s = GetState();
-    std::lock_guard<std::mutex> lock(s.mutex);
-    if (op == kAcquire) {
-        auto channel = s.objects.find({client, *handle});
-        if (channel == s.objects.end() || channel->second.cls != 0xc96f) {
-            fprintf(stderr, "CHANNEL tracker: missing compute channel %x (client %x, %zu tracked objects)\n", *handle, client, s.objects.size());
-            return ENOENT;
-        }
-        Key key{client, channel->second.parent};
-        auto group = s.objects.find(key);
-        if (group == s.objects.end() || group->second.cls != 0xa06c) return ENOENT;
-        Owner owner;
-        owner.fd = fd;
-        owner.subdevice = subdevice;
-        if (!s.owners.emplace(key, std::move(owner)).second) return EBUSY;
-        *handle = key.second;
-        return 0;
-    }
-    auto it = s.owners.find({client, *handle});
-    if (it == s.owners.end()) return ENOENT;
-    auto &owner = it->second;
-    if (owner.fd != fd || owner.subdevice != subdevice) return EINVAL;
-    if (op == kRelease) {
-        if (owner.paused || owner.uncertain) return EBUSY;
-        s.owners.erase(it);
-        return 0;
-    }
-    bool disable = op == kPause;
-    if (disable && owner.uncertain) return EIO;
-    if (!owner.uncertain && owner.paused == disable) return 0;
-    if (disable) {
-        owner.channels.clear();
-        for (const auto &[key, obj] : s.objects) {
-            if (key.first == client && obj.parent == *handle && obj.cls == 0xc96f)
-                owner.channels.push_back(key.second);
-        }
-    }
-    if (owner.channels.empty() || owner.channels.size() > 64) return EOVERFLOW;
+constexpr int MaxAttempts = 3;
+
+Error Issue(int fd, unsigned client, unsigned subdevice, const Owner &owner, bool disable)
+{
     Disable p{};
     p.disable = disable;
     p.count = owner.channels.size();
@@ -125,33 +87,102 @@ int ControlGroup(int fd, unsigned client, unsigned subdevice,
         p.channels[i] = owner.channels[i];
     }
     RmControl c{client, subdevice, 0x2080110b, 0, reinterpret_cast<uint64_t>(&p), sizeof(p), 0};
-    auto issue = [&]() {
-        c.status = 0;
-        int result = RawIoctl(fd, _IOWR('F', 0x2a, RmControl), &c);
-        return result != 0 ? (errno ? errno : EIO) : int(c.status);
-    };
-    // A failed batch may have changed only some channels. Preserve the snapshot
-    // and prohibit lifecycle changes until re-enabling the whole set succeeds.
-    owner.uncertain = true;
-    int error = issue();
-    if (!disable)
-        for (int retry = 0; error && retry < 2; ++retry) error = issue();
-    if (error) {
-        if (disable) {
-            p.disable = false;
-            int recovery = EIO;
-            for (int retry = 0; recovery && retry < 3; ++retry) recovery = issue();
-            if (!recovery) {
-                owner.paused = false;
-                owner.uncertain = false;
-            }
-            fprintf(stderr, "CHANNEL disable failed (%d), rollback=%d\n", error, recovery);
+    if (RawIoctl(fd, _IOWR('F', 0x2a, RmControl), &c) != 0)
+        return {ErrorDomain::System, uint32_t(errno ? errno : EIO)};
+    if (c.status) return {ErrorDomain::Rm, c.status};
+    return {};
+}
+
+Error Restore(int fd, unsigned client, unsigned subdevice, Owner &owner)
+{
+    owner.state = GroupState::Restoring;
+    Error error;
+    for (int attempt = 0; attempt < MaxAttempts; ++attempt) {
+        error = Issue(fd, client, subdevice, owner, false);
+        if (!error.Failed()) {
+            owner.state = GroupState::Running;
+            return {};
         }
-        return error;
     }
-    owner.paused = disable;
-    owner.uncertain = false;
-    return 0;
+    owner.state = GroupState::Unknown;
+    return error;
+}
+
+ControlResult Invalid(int error, GroupState state = GroupState::Unowned)
+{
+    return {{ErrorDomain::Validation, uint32_t(error)}, {}, state};
+}
+}
+
+ControlResult ControlGroup(int fd, unsigned client, unsigned subdevice,
+                           unsigned *handle, int op)
+{
+    if (!handle || fd < 0 || !client || !subdevice || op < kAcquire || op > kConfirmPaused)
+        return Invalid(EINVAL);
+    auto &s = GetState();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (op == kAcquire) {
+        auto channel = s.objects.find({client, *handle});
+        if (channel == s.objects.end() || channel->second.cls != 0xc96f) {
+            fprintf(stderr, "CHANNEL tracker: missing compute channel %x (client %x, %zu tracked objects)\n", *handle, client, s.objects.size());
+            return Invalid(ENOENT);
+        }
+        Key key{client, channel->second.parent};
+        auto group = s.objects.find(key);
+        if (group == s.objects.end() || group->second.cls != 0xa06c) return Invalid(ENOENT);
+        Owner owner;
+        owner.fd = fd;
+        owner.subdevice = subdevice;
+        if (!s.owners.emplace(key, std::move(owner)).second) return Invalid(EBUSY);
+        *handle = key.second;
+        return {{}, {}, GroupState::Running};
+    }
+    auto it = s.owners.find({client, *handle});
+    if (it == s.owners.end()) return Invalid(ENOENT);
+    auto &owner = it->second;
+    if (owner.fd != fd || owner.subdevice != subdevice) return Invalid(EINVAL);
+    if (op == kRelease) {
+        if (owner.state != GroupState::Running) return Invalid(EBUSY, owner.state);
+        s.owners.erase(it);
+        return {};
+    }
+    if (op == kConfirmPaused) {
+        if (owner.state != GroupState::Paused) return Invalid(EBUSY, owner.state);
+        return {{}, {}, owner.state};
+    }
+    if ((op == kPause && owner.state == GroupState::Paused) ||
+        (op == kResume && owner.state == GroupState::Running)) return {{}, {}, owner.state};
+    if (op == kResume) {
+        auto error = Restore(fd, client, subdevice, owner);
+        if (!error.Failed()) owner.channels.clear();
+        return {error, {}, owner.state};
+    }
+    if (owner.state != GroupState::Running) return Invalid(EIO, owner.state);
+    owner.channels.clear();
+    for (const auto &[key, obj] : s.objects) {
+        if (key.first == client && obj.parent == *handle && obj.cls == 0xc96f)
+            owner.channels.push_back(key.second);
+    }
+    if (owner.channels.empty() || owner.channels.size() > 64) {
+        owner.channels.clear();
+        return Invalid(EOVERFLOW, owner.state);
+    }
+
+    Error error;
+    for (int attempt = 0; attempt < MaxAttempts; ++attempt) {
+        owner.state = GroupState::Pausing;
+        error = Issue(fd, client, subdevice, owner, true);
+        if (!error.Failed()) {
+            owner.state = GroupState::Paused;
+            return {{}, {}, owner.state};
+        }
+        // A failed batch may have changed any subset. Never retry disable until
+        // the entire original snapshot has been successfully re-enabled.
+        auto recovery = Restore(fd, client, subdevice, owner);
+        if (recovery.Failed()) return {error, recovery, owner.state};
+    }
+    owner.channels.clear();
+    return {error, {}, owner.state};
 }
 
 } // namespace xsched::cuda::channel::tracker

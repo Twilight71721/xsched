@@ -1,4 +1,5 @@
 #include <utility>
+#include "xsched/cuda/hal/common/levels.h"
 
 #include "xsched/cuda/hal/level3/channel.h"
 #include "xsched/cuda/hal/common/cuda_assert.h"
@@ -8,9 +9,22 @@ using namespace xsched::preempt;
 
 std::shared_ptr<HwQueue> CudaQueueLv3Channel::Create(CUstream stream)
 {
+    XResult status;
+    return Create(stream, status);
+}
+
+std::shared_ptr<HwQueue> CudaQueueLv3Channel::Create(CUstream stream, XResult &status)
+{
+    status = kXSchedErrorNotSupported;
+    CUdevice device;
+    CUDA_ASSERT(Driver::CtxGetDevice(&device));
+    if (GetArch(device) != 120) {
+        XWARN("experimental CHANNEL backend requires sm120");
+        return nullptr;
+    }
     CUcontext context = nullptr;
     CUDA_ASSERT(Driver::StreamGetCtx(stream, &context));
-    auto channel_context = ChannelContext::Create(context);
+    auto channel_context = ChannelContext::Create(context, status);
     if (!channel_context) return nullptr;
     return std::shared_ptr<CudaQueueLv3Channel>(
         new CudaQueueLv3Channel(stream, std::move(channel_context)));
@@ -35,8 +49,8 @@ void CudaQueueLv3Channel::Reactivate(const CommandLog &) { channel_context_->Res
 void CudaQueueLv3Channel::SynchronizeOnSuspend()
 {
     // Synchronous RM disable confirms suspension without completing retained work.
-    if (channel_context_->IsPaused()) return;
-    CudaQueueLv1::Synchronize();
+    if (level_ >= kPreemptLevelDeactivate) channel_context_->ConfirmPaused();
+    else CudaQueueLv1::Synchronize();
 }
 void CudaQueueLv3Channel::OnPreemptLevelChange(XPreemptLevel level)
 {

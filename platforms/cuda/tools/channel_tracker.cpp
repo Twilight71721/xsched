@@ -1,7 +1,7 @@
 #include "channel_tracker_internal.h"
-#include <cstdarg>
-#include <cstring>
-#include <dlfcn.h>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -13,33 +13,28 @@ int RawIoctl(int fd, unsigned long request, void *argument)
 }
 }
 
-extern "C" int ioctl(int fd, unsigned long request, ...) noexcept
+// Called by the x86-64 ABI trampoline. Keep the third register as an opaque
+// word until both the request and device have been identified as NVIDIA RM.
+extern "C" __attribute__((visibility("hidden")))
+int xsched_cuda_tracker_ioctl(int fd, unsigned long request, uintptr_t argument) noexcept
 {
-    va_list args;
-    va_start(args, request);
-    void *argument = va_arg(args, void *);
-    va_end(args);
-    return xsched::cuda::channel::tracker::TrackIoctl(fd, request, argument);
+    using namespace xsched::cuda::channel::tracker;
+    if (request == _IOWR('F', 0x2b, Alloc21) || request == _IOWR('F', 0x2b, Alloc64) ||
+        request == _IOWR('F', 0x29, Free)) {
+        int saved_errno = errno;
+        struct stat device{};
+        // NVIDIA's control/GPU nodes use character-device major 195. Do not
+        // parse an unrelated device's request even if its ioctl number matches.
+        bool nvidia = fstat(fd, &device) == 0 && S_ISCHR(device.st_mode) && major(device.st_rdev) == 195;
+        errno = saved_errno;
+        if (nvidia) return TrackIoctl(fd, request, reinterpret_cast<void *>(argument));
+    }
+    return syscall(SYS_ioctl, fd, request, argument);
 }
 
-extern "C" int xsched_cuda_channel_control_v2(int fd, unsigned client, unsigned subdevice,
-                                             unsigned *handle, int operation)
+extern "C" xsched::cuda::channel::ControlResult
+xsched_cuda_channel_control_v3(int fd, unsigned client, unsigned subdevice,
+                               unsigned *handle, int operation)
 {
     return xsched::cuda::channel::tracker::ControlGroup(fd, client, subdevice, handle, operation);
-}
-
-// XSched normally deep-binds the real driver, which bypasses ioctl interposition.
-// Only this explicitly preloaded experimental helper changes libcuda loading.
-extern "C" void *dlopen(const char *filename, int flags) noexcept
-{
-    using Open = void *(*)(const char *, int);
-    static auto real_open = reinterpret_cast<Open>(dlsym(RTLD_NEXT, "dlopen"));
-    if (!real_open) return nullptr;
-    if (filename) {
-        const char *name = std::strrchr(filename, '/');
-        name = name ? name + 1 : filename;
-        if (std::strcmp(name, "libcuda.so") == 0 || std::strncmp(name, "libcuda.so.", 11) == 0)
-            flags &= ~RTLD_DEEPBIND;
-    }
-    return real_open(filename, flags);
 }

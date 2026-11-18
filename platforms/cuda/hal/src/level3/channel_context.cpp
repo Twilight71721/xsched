@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -29,12 +30,13 @@ bool ValidatedDriver()
 }
 #endif
 }
-std::unique_ptr<ChannelContext> ChannelContext::Create(CUcontext context)
+std::unique_ptr<ChannelContext> ChannelContext::Create(CUcontext context, XResult &status)
 {
+    status = kXSchedErrorNotSupported;
 #if defined(__linux__) && defined(__x86_64__)
     auto control = reinterpret_cast<Control>(dlsym(RTLD_DEFAULT, channel::ControlSymbol));
     if (!control || !ValidatedDriver()) {
-        XWARN("CHANNEL requires the v2 tracker preloaded before CUDA initialization and driver %s",
+        XWARN("CHANNEL requires the v3 tracker preloaded before CUDA initialization and driver %s",
               channel::ValidatedDriverVersion);
         return nullptr;
     }
@@ -44,7 +46,10 @@ std::unique_ptr<ChannelContext> ChannelContext::Create(CUcontext context)
     XASSERT(current == context, "CHANNEL context does not match the current CUDA context");
     CUDA_ASSERT(Driver::CtxGetDevice(&device));
     auto guard = CudaContextGuard::AcquireExclusive(context, device);
-    if (!guard) return nullptr;
+    if (!guard) {
+        status = kXSchedErrorNotAllowed;
+        return nullptr;
+    }
     // Private ToolsRm ABI used by the bundled cuXtra; validated on driver 595.71.05.
     const unsigned char bytes[16] = {0x14,0x06,0x18,0x0d,0x72,0xd6,0xcb,0x47,
                                      0xab,0x6e,0xb9,0x63,0xe5,0x1b,0xf4,0xc6};
@@ -75,11 +80,15 @@ std::unique_ptr<ChannelContext> ChannelContext::Create(CUcontext context)
     if (!client || !subdevice || !group || client != channel_client || fd < 0) return nullptr;
     auto instance = std::unique_ptr<ChannelContext>(
         new ChannelContext(std::move(guard), control, fd, client, subdevice));
-    int result = control(fd, client, subdevice, &group, channel::kAcquire);
-    if (result != 0) {
-        XWARN("CHANNEL registration failed (%d); no queue was registered", result);
+    auto result = control(fd, client, subdevice, &group, channel::kAcquire);
+    if (!result.Succeeded()) {
+        if (result.error.domain == channel::ErrorDomain::Validation && result.error.code == EBUSY)
+            status = kXSchedErrorNotAllowed;
+        XWARN("CHANNEL registration failed (domain=%u code=0x%x); no queue was registered",
+              unsigned(result.error.domain), result.error.code);
         return nullptr;
     }
+    status = kXSchedSuccess;
     instance->group_ = group;
     return instance;
 #else
@@ -97,35 +106,16 @@ ChannelContext::~ChannelContext()
 {
     if (!group_) return;
     Restore();
-    int result = control_(fd_, client_, subdevice_, &group_, channel::kRelease);
-    XASSERT(result == 0, "CHANNEL release failed: %d", result);
+    ControlGroup(channel::kRelease);
 }
-void ChannelContext::Interrupt()
+void ChannelContext::ControlGroup(channel::Operation operation)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (paused_) return;
-    int result = 0;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        result = control_(fd_, client_, subdevice_, &group_, channel::kPause);
-        if (!result) break;
-        int recovery = control_(fd_, client_, subdevice_, &group_, channel::kResume);
-        XASSERT(recovery == 0, "CHANNEL pause failed (%d), recovery failed (%d); hardware state unknown",
-                result, recovery);
-    }
-    XASSERT(result == 0, "CHANNEL pause failed after bounded retries: %d; channels restored", result);
-    paused_ = true;
+    auto result = control_(fd_, client_, subdevice_, &group_, operation);
+    XASSERT(result.Succeeded(),
+            "CHANNEL operation=%d failed: domain=%u code=0x%x recovery_domain=%u recovery_code=0x%x state=%u",
+            int(operation), unsigned(result.error.domain), result.error.code,
+            unsigned(result.recovery_error.domain), result.recovery_error.code, unsigned(result.state));
 }
-void ChannelContext::Restore()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!paused_) return;
-    int result = control_(fd_, client_, subdevice_, &group_, channel::kResume);
-    XASSERT(result == 0, "CHANNEL resume failed: %d", result);
-    paused_ = false;
-}
-
-bool ChannelContext::IsPaused()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    return paused_;
-}
+void ChannelContext::Interrupt() { ControlGroup(channel::kPause); }
+void ChannelContext::Restore() { ControlGroup(channel::kResume); }
+void ChannelContext::ConfirmPaused() { ControlGroup(channel::kConfirmPaused); }

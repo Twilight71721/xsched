@@ -14,7 +14,7 @@
 using namespace xsched::cuda;
 using namespace xsched::preempt;
 
-static int32_t GetArch(CUdevice dev)
+int32_t xsched::cuda::GetArch(CUdevice dev)
 {
     // see https://developer.nvidia.com/cuda-legacy-gpus
     // see https://developer.nvidia.com/cuda-gpus
@@ -73,10 +73,6 @@ std::shared_ptr<HwQueue> xsched::cuda::CudaQueueCreate(CUstream stream)
     CUDA_ASSERT(Driver::CtxGetDevice(&dev));
 
     if (GetCudaLv3Implementation() == kCudaLv3ImplementationChannel) {
-        if (GetArch(dev) != 120) {
-            XWARN("experimental CHANNEL backend requires sm120");
-            return nullptr;
-        }
         return CudaQueueLv3Channel::Create(stream);
     }
 

@@ -93,6 +93,8 @@ public:
     STATIC_CLASS(HwQueueManager);
 
     static XResult Add(HwQueueHandle hwq_h, std::function<std::shared_ptr<HwQueue>()> create);
+    static XResult Add(HwQueueHandle hwq_h, std::function<std::shared_ptr<HwQueue>()> create,
+                       bool require_new);
     static XResult Del(HwQueueHandle hwq_h);
     static std::shared_ptr<HwQueue> Get(HwQueueHandle hwq_h);
     static std::shared_ptr<XQueue> GetXQueue(HwQueueHandle hwq_h);

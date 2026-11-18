@@ -9,6 +9,7 @@
 namespace xsched::cuda
 {
 
+int32_t GetArch(CUdevice dev);
 std::shared_ptr<preempt::HwQueue> CudaQueueCreate(CUstream stream);
 CUresult DirectLaunch(std::shared_ptr<CudaKernelCommand> kernel, CUstream stream);
 

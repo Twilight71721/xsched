@@ -20,8 +20,21 @@ stop. Use separate CUDA contexts for independently controlled tasks, and account
 for any cross-context event/data dependencies when scheduling them.
 
 The optional preload library observes this process's successful RM allocations
-and frees. It removes `RTLD_DEEPBIND` only from libcuda loads so ioctl calls can
-be intercepted. It does not enumerate or control other processes' objects.
+and frees on NVIDIA character devices (major 195). It does not enumerate or
+control other processes' objects. Its Linux x86-64 SysV entry point forwards
+the ioctl argument register without assuming the optional argument is a pointer;
+only recognized RM allocation/free requests on NVIDIA devices are decoded.
+Unrelated requests go directly to the system call with their argument unchanged.
+
+Set `XSCHED_CUDA_LV3_IMPL=CHANNEL` before the first XSched CUDA call. XSched's
+CUDA loader then opens the real driver without `RTLD_DEEPBIND`; other backends
+retain their previous loading flags. The tracker no longer intercepts `dlopen`
+or changes other libraries' loading choices. Normal external loading of the
+driver before XSched is supported when the tracker was preloaded at process
+startup. External deep-binding, a separate loader namespace, direct system calls
+or loading the tracker after CUDA initialization can bypass tracking and are
+unsupported. Missing allocation history makes queue acquisition fail; it must
+not be repaired by guessing channel handles or silently falling back to LV1.
 
 ## Validated configuration
 
@@ -29,11 +42,47 @@ be intercepted. It does not enumerate or control other processes' objects.
 - NVIDIA driver **595.71.05**, CUDA Toolkit **13.0**, native `sm_120` kernels.
 - Explicit application-managed queues; one managed owner per compute group.
 
-Queue creation requires the v2 tracker symbol and the exact driver version from
+Queue creation requires the v3 tracker symbol and the exact driver version from
 `/proc/driver/nvidia/version`. An unavailable tracker, unsupported driver or GPU,
 unrecognized handle, or duplicate owner returns an error without registering a
 queue or silently falling back to Level 1. Other driver versions require ABI
 review and hardware validation before changing the version check.
+
+## Allocate a task domain
+
+A task domain owns one scheduler-visible LV3 XQueue and one exclusive compute
+group. Select CHANNEL and load the tracker and CUDA shim as described above.
+Create a domain before the task initializes its CUDA libraries or device buffers.
+
+- `CudaTaskDomainCreate(&domain, ordinal)` creates a dedicated ordinary CUDA
+  context and a nonblocking stream. Each independently scheduled task gets its
+  own domain. The calling thread's previous CUDA context is restored.
+- `CudaTaskDomainAttach(&domain, stream)` borrows an idle, explicit stream in an
+  ordinary context the application dedicates to this task. The caller must
+  quiesce submitters during admission, keep the stream and context alive, and
+  transfer submissions to the domain. A busy stream, registered stream, or
+  managed group conflict returns `kXSchedErrorNotAllowed`. The allocator cannot
+  discover unregistered application tasks that share that context.
+- `CudaTaskDomainWithStream(domain, work, arg)` invokes a host callback with the
+  domain context current. Initialize library handles in that context, bind them
+  to the supplied stream, and enqueue work there. The callback returns an
+  `XResult` and must leave the context stack balanced. Work on other streams
+  can share hardware suspension yet escape this XQueue's submission accounting.
+- `CudaTaskDomainGetQueue(domain, &queue)` supplies a borrowed handle for policy
+  hints and XQueue control. The domain owns destruction of the queue. The
+  allocator does not select a scheduler or change its policy.
+- Stop submissions and join host users of the domain, including users issuing
+  queue controls, before `CudaTaskDomainDestroy(&domain)`. Destruction resumes
+  and drains the queue, releases its group, then frees owned CUDA resources.
+  An attached stream and context remain owned by the application. Success
+  clears the domain pointer. On a teardown error retain the handle for cleanup;
+  a partially closed domain must not be used for new work. The underlying HAL
+  retains its fail-stop behavior on persistent RM control failures.
+
+The `sm120_task_domain` test uses a running kernel in each domain and checks
+the command counters, bidirectional suspension, final arithmetic, concurrent
+admission and resource reuse. The CHANNEL contract runner exercises both
+new/new and new/attached task layouts.
 
 ## Queue contract
 
@@ -58,12 +107,28 @@ review and hardware validation before changing the version check.
   queue operations. Suspend/resume controls on an AsyncXQueue are serialized.
 
 A failed batch disable may have affected some channels. The tracker retains the
-snapshot, attempts to enable the entire set, and never treats a successful
-rollback as successful suspension. Enable and rollback use up to three attempts;
-the HAL may retry pause up to three times. An uncertain state prevents lifecycle
-changes until restoration succeeds. Persistent runtime failures terminate with
-a diagnostic because the HAL control methods return `void`. This is fail-stop
-handling, not a recoverable-error API.
+snapshot and attempts to enable the entire set. It owns all retries: at most
+three disable attempts, with at most three enable attempts for each rollback.
+A new disable is attempted only after successful restoration. Successful
+rollback alone never means successful suspension; only a later successful
+disable does. Normal resume also uses at most three enable attempts.
+
+The tracker is the sole authority for hardware state:
+`Running -> Pausing -> Paused -> Restoring -> Running`. An unsuccessful
+restoration leaves `Unknown`, retaining the snapshot and rejecting pause,
+confirmation, release and group lifetime changes until explicit restoration
+succeeds. `ChannelContext` owns the binding and context lifetime guard but no
+longer keeps a second pause flag, mutex or retry loop. Suspension confirmation
+checks the tracker state; LV1 synchronization still waits for stream completion.
+The private v3 result distinguishes validation, syscall and RM errors, includes
+the final state and reports rollback failure separately from the original error.
+HAL and tracker must be rebuilt together; v2 is deliberately not accepted.
+
+Persistent runtime failures terminate with a diagnostic because the HAL control
+methods return `void`. This is fail-stop handling, not a recoverable-error API.
+The registry lock continues to serialize object lifetime changes with driver
+control. It is intentionally held across ioctl calls; releasing it without
+pinning the object graph would allow channels to escape the pause snapshot.
 
 ## Limitations
 
@@ -122,8 +187,8 @@ backends; they do not validate TSG timeslice-zero semantics on other hardware.
 ## Build and test
 
 Production builds use `BUILD_TEST=OFF` (the default). This omits test executables
-and test syscall implementations. The tracker exports only `ioctl`, `dlopen`
-and the versioned internal `xsched_cuda_channel_control_v2` entry point; its
+and test syscall implementations. The tracker exports only `ioctl`
+and the versioned internal `xsched_cuda_channel_control_v3` entry point; its
 private implementation header is not installed. There is no public CHANNEL
 inspection/test API. The scope and limitations above are the backend contract.
 
@@ -136,7 +201,7 @@ cmake -S . -B build-channel -DPLATFORM_CUDA=ON -DSHIM_SOFTLINK=ON \
   -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_INSTALL_PREFIX="$PWD/output-channel"
 cmake --build build-channel -j8
 cmake --install build-channel
-ctest --test-dir build-channel -R cuda_channel_tracker_test --output-on-failure
+ctest --test-dir build-channel -R '^(async_xqueue_control_test|cuda_channel_.*test)$' --output-on-failure
 python3 platforms/cuda/test/scripts/run_lv3_contracts.py \
   --install output-channel --build build-channel \
   --output /tmp/xsched-channel-contracts-new --repeats 3
@@ -151,8 +216,14 @@ and saves metadata, binary hashes, stdout/stderr and a summary. It controls only
 the test process's channels and requires no root privileges or driver changes.
 
 The CPU test links the production tracker core with its own syscall implementation and covers
-ownership, binding, lifecycle guards, partial disable, rollback, retry, uncertain
-state recovery and overflow. It does not inject actual driver/firmware failures.
+ownership, binding, lifecycle guards, partial disable, bounded retries, rollback,
+unknown-state recovery, confirmation, error domains and overflow. It does not
+inject actual driver/firmware failures. The ioctl tests exercise both native and
+preloaded calls with no argument, scalar and pointer arguments, kernel errors,
+and colliding RM request numbers on non-NVIDIA descriptors.
+The GPU loading tests check XSched-first loading, ordinary external driver-first
+loading, and rejection after external deep-bound initialization. Each mode runs
+in a fresh process so loader state cannot leak between tests.
 
 `sm120_lv3` checks real shim submission, concurrent streams, 3D grids/blocks,
 repeated suspension of unfinished kernels, exact non-idempotent counts and
@@ -166,12 +237,14 @@ queue. GPU tests exit normally and exercise cleanup; they do not use `_Exit`.
 ## Implementation map
 
 - `hal/src/level3/channel.cpp`: XSched queue interface and delegation to an exclusive `ChannelContext`.
-- `hal/src/level3/channel_context.cpp`: ownership, ToolsRm lookup, pause/resume and cleanup. Each queue owns its context controller; controllers are not shared like `TsgContext`. Context lifetime protection is held through a common RAII guard.
+- `hal/src/level3/channel_context.cpp`: ownership, ToolsRm lookup and delegation to tracker transactions. Each queue owns its context controller; controllers are not shared like `TsgContext`. Context lifetime protection is held through a common RAII guard.
 - `hal/include/xsched/cuda/hal/level3/channel_control.h`: internal tracker ABI.
 - `tools/channel_tracker.cpp`: preload entry points and real system-call transport.
+- `tools/channel_tracker_ioctl.S`: Linux x86-64 ioctl argument-register forwarding.
 - `tools/channel_tracker_core.cpp`: RM object tracking, ownership and disable/enable transactions.
 - `tools/channel_tracker_internal.h`: private RM layouts and implementation declarations.
-- `tools/channel_tracker.map`: export allowlist for the three required preload symbols.
+- `tools/channel_tracker.map`: export allowlist for the two required preload symbols.
+- `hal/src/common/driver.cpp`: CUDA-only loader policy; CHANNEL avoids deep-binding without a global `dlopen` wrapper.
 - `preempt/src/xqueue/async_xqueue.cpp`: control serialization and suspension boundary.
 - `hal/src/common/context_guard.cpp`: backend-independent, opt-in context ownership and guarded destroy/reset. An exclusive guard is held from backend acquisition through RM cleanup; it does not change ordinary LV1 queue ownership.
 - `hal/include/xsched/cuda/hal/level1/cuda_queue.h`: `SupportNativeEventWait()` defaults to false. A backend opts in only if submitted native event dependencies remain valid across its preemption/restoration and cancellation behavior.

@@ -31,7 +31,7 @@ static_assert(offsetof(Disable, event) == 16 && offsetof(Disable, clients) == 24
 using Key = std::pair<uint32_t, uint32_t>;
 struct Object { uint32_t parent, cls; };
 struct Owner {
-    bool paused = false, uncertain = false;
+    GroupState state = GroupState::Running;
     int fd = -1;
     unsigned subdevice = 0;
     std::vector<uint32_t> channels;
@@ -45,5 +45,6 @@ struct State {
 State &GetState();
 int RawIoctl(int fd, unsigned long request, void *argument);
 int TrackIoctl(int fd, unsigned long request, void *argument);
-int ControlGroup(int fd, unsigned client, unsigned subdevice, unsigned *handle, int operation);
+ControlResult ControlGroup(int fd, unsigned client, unsigned subdevice,
+                           unsigned *handle, int operation);
 } // namespace xsched::cuda::channel::tracker
